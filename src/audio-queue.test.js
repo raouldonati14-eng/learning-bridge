@@ -1,0 +1,4 @@
+import test from 'node:test';import assert from 'node:assert/strict';import{queueMetrics,playbackRateFor,recoveryPlan}from'./audio-queue.js';
+test('queue metrics and rate rise with backlog',()=>{const items=[{spanish:'uno dos tres',sentAt:1000,durationMs:7000},{spanish:'cuatro',sentAt:2000,durationMs:7000}];const m=queueMetrics(items,5000);assert.equal(m.queuedSegments,2);assert.equal(m.queuedDurationMs,14000);assert.equal(playbackRateFor(m),1.18);});
+test('recovery keeps recent audio and reports skipped segments',()=>{const items=Array.from({length:6},(_,i)=>({id:i,sentAt:i*1000,durationMs:5000}));const plan=recoveryPlan(items,40_000);assert.deepEqual(plan.skipped.map(x=>x.id),[0,1,2,3]);assert.deepEqual(plan.play.map(x=>x.id),[4,5]);});
+test('normal queue is never discarded',()=>{const items=[{id:1,sentAt:9000,durationMs:4000}];assert.equal(recoveryPlan(items,10_000).skipped.length,0);});

@@ -1,0 +1,10 @@
+import speech from '@google-cloud/speech';
+import {TranslationServiceClient} from '@google-cloud/translate';
+import textToSpeech from '@google-cloud/text-to-speech';
+import{googleCredentials}from'./config.js';
+export class GoogleServices {
+  constructor({projectId=process.env.GOOGLE_CLOUD_PROJECT,location=process.env.GOOGLE_CLOUD_LOCATION||'global',credentials=googleCredentials()}={}){this.projectId=projectId;this.location=location;const options=credentials?{projectId,credentials}:{projectId};this.speechClient=new speech.SpeechClient(options);this.translationClient=new TranslationServiceClient(options);this.ttsClient=new textToSpeech.TextToSpeechClient(options);}
+  createRecognition(onResult,onError){let stream,restartTimer,active=true;const open=()=>{if(!active)return;stream=this.speechClient.streamingRecognize({config:{encoding:'LINEAR16',sampleRateHertz:16000,languageCode:'en-US',enableAutomaticPunctuation:true,model:'latest_long'},interimResults:true}).on('data',data=>{for(const result of data.results||[]){const a=result.alternatives?.[0];if(a?.transcript)onResult({text:a.transcript,isFinal:Boolean(result.isFinal),stability:result.stability||0,transcribedAt:Date.now()});}}).on('error',err=>{if(active&&err.code!==1)onError(err);});restartTimer=setTimeout(()=>{stream?.end();open();},4*60_000);};open();return{write(chunk){if(active&&stream?.writable)stream.write(chunk);},stop(){active=false;clearTimeout(restartTimer);stream?.end();}};}
+  async translate(text,target='es'){if(!this.projectId)throw new Error('GOOGLE_CLOUD_PROJECT is not configured');const [response]=await this.translationClient.translateText({parent:`projects/${this.projectId}/locations/${this.location}`,contents:[text],mimeType:'text/plain',sourceLanguageCode:'en',targetLanguageCode:target});return response.translations?.[0]?.translatedText||'';}
+  async synthesizeSpanish(text){const [response]=await this.ttsClient.synthesizeSpeech({input:{text},voice:{languageCode:'es-US',name:process.env.GOOGLE_TTS_VOICE||'es-US-Neural2-A'},audioConfig:{audioEncoding:'MP3',speakingRate:1.05}});return Buffer.from(response.audioContent).toString('base64');}
+}

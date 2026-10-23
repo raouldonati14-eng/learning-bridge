@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: the-learning-bridge
+    runtime: node
+    region: ohio
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeployTrigger: off
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: GOOGLE_CLOUD_LOCATION
+        value: global
+      - key: GOOGLE_TTS_VOICE
+        value: es-US-Neural2-A
+      - key: SESSION_IDLE_MINUTES
+        value: 30
+      - key: GOOGLE_CLOUD_PROJECT
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/google-service-account.json
+      - key: TEACHER_ACCESS_CODE
+        sync: false

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+credentials/
+*service-account*.json
+*credentials*.json
+application_default_credentials.json
+latency-*.csv
+npm-debug.log*
+*.backup
+spanish-test.mp3

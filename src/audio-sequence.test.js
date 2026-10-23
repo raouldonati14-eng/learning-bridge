@@ -1,0 +1,4 @@
+import test from'node:test';import assert from'node:assert/strict';import{advancePastUnavailable,retryBlockedSegment}from'./audio-sequence.js';
+test('an unavailable future segment remains recorded until playback reaches it',()=>{const missing=new Set([3]);assert.equal(advancePastUnavailable(1,missing),1);assert.equal(missing.has(3),true);assert.equal(advancePastUnavailable(3,missing),4);assert.equal(missing.size,0);});
+test('consecutive missing segments cannot deadlock ordered playback',()=>{const missing=new Set([2,3,4]);assert.equal(advancePastUnavailable(2,missing),5);});
+test('autoplay rejection restores the removed segment for a user retry',()=>{const pending=new Map();const next=retryBlockedSegment({segment:{sequence:7},pending,nextSequence:8});assert.equal(next,7);assert.equal(pending.has(7),true);});
