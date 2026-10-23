@@ -1,30 +1,514 @@
-import crypto from 'node:crypto';import fs from 'node:fs';import path from 'node:path';import {fileURLToPath} from 'node:url';import express from 'express';import {createServer} from 'node:http';import {Server} from 'socket.io';import {SessionStore} from './session-store.js';import {GoogleServices} from './google-services.js';import{PhraseSegmenter}from'./phrase-segmenter.js';import{isAllowedSocketOrigin,parsePositiveNumber,socketCorsOptions,teacherAccessRequired,validTeacherAccess}from'./config.js';
-const port=parsePositiveNumber(process.env.PORT,8080),app=express(),httpServer=createServer(app),io=new Server(httpServer,{cors:socketCorsOptions(),allowRequest:(request,callback)=>callback(null,isAllowedSocketOrigin(request)),maxHttpBufferSize:64_000,pingInterval:25_000,pingTimeout:20_000}),store=new SessionStore({idleMs:parsePositiveNumber(process.env.SESSION_IDLE_MINUTES,30)*60_000}),google=new GoogleServices();
-const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),credentialFile=process.env.GOOGLE_APPLICATION_CREDENTIALS,googleConfigured=Boolean(process.env.GOOGLE_CLOUD_PROJECT)&&(!process.env.RENDER||Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64||(credentialFile&&fs.existsSync(credentialFile))));
-app.disable('x-powered-by');app.use((_req,res,next)=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('Permissions-Policy','microphone=(self), camera=(), geolocation=()');res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' ws: wss:; media-src 'self' data: blob:; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");if(process.env.NODE_ENV==='production')res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');next();});
-app.get('/api/health',(_q,res)=>res.status(googleConfigured?200:503).json({ok:googleConfigured,activeSessions:store.sessions.size}));app.get('/api/config',(_q,res)=>res.json({teacherAccessRequired:teacherAccessRequired()}));app.use(express.static(path.join(root,'dist'),{index:false,maxAge:process.env.NODE_ENV==='production'?'1h':0}));app.get('*path',(_q,res,next)=>res.sendFile(path.join(root,'dist','index.html'),e=>e&&next(e)));
-const room=code=>`session:${code}`;const publicSegment=({audioBase64,...segment})=>segment;const state=s=>({code:s.code,status:s.status,studentCount:s.students.size,segments:s.segments.slice(-100).map(publicSegment),nextSequence:s.nextSequence});const emitState=s=>io.to(room(s.code)).emit('session:state',state(s));const cancelSegment=(s,segment,provider='both')=>io.to(room(s.code)).emit('segment:unavailable',{sequence:segment.sequence,provider});const finish=s=>{s.generation++;s.recognizer?.stop();s.recognizer=null;s.status='ended';emitState(s);};
-io.on('connection',socket=>{
- socket.on('teacher:create',({accessCode}={},reply=()=>{})=>{if(!validTeacherAccess(accessCode)){socket.data.teacherAccessFailures=(socket.data.teacherAccessFailures||0)+1;reply({ok:false,error:'Teacher access code is invalid.'});if(socket.data.teacherAccessFailures>=5)setTimeout(()=>socket.disconnect(true),100);return;}socket.data.teacherAccessFailures=0;store.removeTeacher(socket.id);const s=store.create(socket.id);socket.data.role='teacher';socket.join(room(s.code));reply({ok:true,session:state(s)});});
- socket.on('student:join',({code}={},reply=()=>{})=>{const s=store.get(code);if(!s||s.status==='ended')return reply({ok:false,error:'Session not found or has ended.'});s.students.add(socket.id);socket.data.role='student';socket.data.sessionCode=s.code;socket.join(room(s.code));emitState(s);reply({ok:true,session:state(s)});});
- socket.on('lecture:start',({code},reply=()=>{})=>{const s=store.get(code);if(!s||s.teacherId!==socket.id)return reply({ok:false,error:'Invalid teacher session.'});try{s.recognizer?.stop();s.recognizer=recognizer(s,socket);s.status='live';emitState(s);reply({ok:true});}catch(e){reply({ok:false,error:e.message});}});
- socket.on('dev:test-translation',async ({code}={},reply=()=>{})=>{
-  const remote=socket.handshake.address;
-  if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(remote))return reply({ok:false,error:'Local testing only.'});
-  const s=store.get(code);
-  if(!s||s.teacherId!==socket.id||!['ready','live'].includes(s.status))return reply({ok:false,error:'Invalid or inactive teacher session.'});
-  if(s.recognizer)return reply({ok:false,error:'Stop microphone lecture before testing.'});
-  s.status='live';emitState(s);
-  reply({ok:true});
-  await processPhrase(s,{text:'Good morning, class. Today we are learning how alcohol affects the brain and body.',source:'development-test',audioAt:Date.now(),transcribedAt:Date.now(),stability:1});
- }); socket.on('audio:chunk',({code,audio,capturedAt})=>{const s=store.get(code);if(s?.teacherId===socket.id&&s.status==='live'){s.lastAudioAt=Number(capturedAt)||Date.now();s.phraseAudioAt??=s.lastAudioAt;s.recognizer?.write(Buffer.from(audio));}});
- socket.on('lecture:pause',({code})=>{const s=store.get(code);if(s?.teacherId===socket.id){s.generation++;s.recognizer?.stop();s.recognizer=null;s.status='paused';emitState(s);}});
- socket.on('lecture:resume',({code})=>{const s=store.get(code);if(s?.teacherId===socket.id){s.recognizer=recognizer(s,socket);s.status='live';emitState(s);}});
- socket.on('lecture:end',({code})=>{const s=store.get(code);if(s?.teacherId===socket.id)finish(s);});
- socket.on('audio:playback',({code,segmentId,event,at,queue,provider})=>{const s=store.get(code),seg=s?.segments.find(x=>x.id===segmentId);if(!seg)return;const playbackAt=Number(at);console.info('[audio-queue]',JSON.stringify({code,segmentId,sequence:seg.sequence,provider:provider==='browser'?'browser':'google',event,speechToAudioStartMs:event==='started'?playbackAt-seg.audioAt:undefined,translationToAudioStartMs:event==='started'?playbackAt-seg.translatedAt:undefined,queue}));});
- socket.on('disconnect',()=>{const s=store.sessions.get(socket.data.sessionCode);if(s){s.students.delete(socket.id);emitState(s);}for(const x of store.sessions.values())if(x.teacherId===socket.id)finish(x);});
+
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import express from 'express';
+import { createServer } from 'node:http';
+import { Server } from 'socket.io';
+import { SessionStore } from './session-store.js';
+import { GoogleServices } from './google-services.js';
+import { PhraseSegmenter } from './phrase-segmenter.js';
+import {
+  isAllowedSocketOrigin,
+  parsePositiveNumber,
+  socketCorsOptions,
+  teacherAccessRequired,
+  validTeacherAccess
+} from './config.js';
+
+const port = parsePositiveNumber(process.env.PORT, 8080);
+const app = express();
+const httpServer = createServer(app);
+
+const io = new Server(httpServer, {
+  cors: socketCorsOptions(),
+  allowRequest: (request, callback) =>
+    callback(null, isAllowedSocketOrigin(request)),
+  maxHttpBufferSize: 64_000,
+  pingInterval: 25_000,
+  pingTimeout: 20_000
 });
-function recognizer(s,socket){s.phraseSegmenter=new PhraseSegmenter();s.phraseAudioAt=null;return google.createRecognition(r=>handleRecognition(s,r),e=>{console.error('[speech]',e);socket.emit('lecture:error','Speech recognition stopped. Check Google Cloud setup.');});}
-function handleRecognition(s,result){io.to(room(s.code)).emit('transcript:interim',{text:result.text,isFinal:result.isFinal});if(s.status!=='live')return;for(const phrase of s.phraseSegmenter.push(result)){const audioAt=s.phraseAudioAt||s.lastAudioAt||result.transcribedAt;s.phraseAudioAt=s.lastAudioAt;processPhrase(s,{...result,text:phrase.text,source:phrase.source,audioAt});}}
-async function processPhrase(s,result){const generation=s.generation,segment={id:crypto.randomUUID(),sequence:s.nextSequence++,english:result.text,source:result.source,spanish:'',audioAt:result.audioAt,transcribedAt:result.transcribedAt,translationRequestedAt:Date.now()};s.segments.push(segment);if(s.segments.length>200)s.segments.shift();console.info('[segmentation]',JSON.stringify({code:s.code,sequence:segment.sequence,source:segment.source,words:segment.english.split(/\s+/).length,stability:result.stability}));try{segment.spanish=await google.translate(result.text,'es');segment.translatedAt=Date.now();if(s.status!=='live'||s.generation!==generation){cancelSegment(s,segment,'both');return;}segment.sentAt=Date.now();io.to(room(s.code)).emit('segment:translated',publicSegment(segment));segment.ttsRequestedAt=Date.now();segment.audioBase64=await google.synthesizeSpanish(segment.spanish);segment.ttsReturnedAt=Date.now();if(s.status!=='live'||s.generation!==generation){cancelSegment(s,segment,'google');return;}segment.sentAt=Date.now();io.to(room(s.code)).emit('segment:ready',segment);console.info('[latency]',JSON.stringify({code:s.code,segmentId:segment.id,sequence:segment.sequence,source:segment.source,audioToTranscriptMs:segment.transcribedAt-segment.audioAt,translationMs:segment.translatedAt-segment.translationRequestedAt,ttsMs:segment.ttsReturnedAt-segment.ttsRequestedAt,serverToAudioReadyMs:segment.sentAt-segment.audioAt}));}catch(e){console.error('[voice-pipeline]',e);cancelSegment(s,segment,segment.spanish?'google':'both');io.to(room(s.code)).emit('lecture:error','Voice translation failed. Check Google Cloud setup.');}}
-setInterval(()=>store.sweep(),60_000).unref();let shuttingDown=false;function shutdown(signal){if(shuttingDown)return;shuttingDown=true;console.info(`[shutdown] ${signal}`);for(const session of store.sessions.values())finish(session);io.close(()=>httpServer.close(()=>process.exit(0)));setTimeout(()=>process.exit(1),25_000).unref();}process.on('SIGTERM',()=>shutdown('SIGTERM'));process.on('SIGINT',()=>shutdown('SIGINT'));httpServer.listen(port,'0.0.0.0',()=>console.log(`LectureBridge server listening on 0.0.0.0:${port}`));
+
+const store = new SessionStore({
+  idleMs: parsePositiveNumber(process.env.SESSION_IDLE_MINUTES, 30) * 60_000
+});
+
+const google = new GoogleServices();
+
+const root = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..'
+);
+
+const credentialFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+const googleConfigured =
+  Boolean(process.env.GOOGLE_CLOUD_PROJECT) &&
+  (
+    !process.env.RENDER ||
+    Boolean(
+      process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 ||
+      (credentialFile && fs.existsSync(credentialFile))
+    )
+  );
+
+app.disable('x-powered-by');
+
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+
+  res.setHeader(
+    'Permissions-Policy',
+    'microphone=(self), camera=(), geolocation=()'
+  );
+
+  // Allow blob: scripts for the microphone AudioWorklet.
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; " +
+    "script-src 'self' blob:; " +
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+    "font-src 'self' https://fonts.gstatic.com data:; " +
+    "connect-src 'self' ws: wss:; " +
+    "media-src 'self' data: blob:; " +
+    "img-src 'self' data:; " +
+    "object-src 'none'; " +
+    "base-uri 'self'; " +
+    "frame-ancestors 'none'"
+  );
+
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader(
+      'Strict-Transport-Security',
+      'max-age=31536000; includeSubDomains'
+    );
+  }
+
+  next();
+});
+
+app.get('/api/health', (_q, res) =>
+  res.status(googleConfigured ? 200 : 503).json({
+    ok: googleConfigured,
+    activeSessions: store.sessions.size
+  })
+);
+
+app.get('/api/config', (_q, res) =>
+  res.json({
+    teacherAccessRequired: teacherAccessRequired()
+  })
+);
+
+app.use(
+  express.static(path.join(root, 'dist'), {
+    index: false,
+    maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0
+  })
+);
+
+app.get('*path', (_q, res, next) =>
+  res.sendFile(
+    path.join(root, 'dist', 'index.html'),
+    error => error && next(error)
+  )
+);
+
+const room = code => `session:${code}`;
+
+const publicSegment = ({ audioBase64, ...segment }) => segment;
+
+const state = s => ({
+  code: s.code,
+  status: s.status,
+  studentCount: s.students.size,
+  segments: s.segments.slice(-100).map(publicSegment),
+  nextSequence: s.nextSequence
+});
+
+const emitState = s =>
+  io.to(room(s.code)).emit('session:state', state(s));
+
+const cancelSegment = (s, segment, provider = 'both') =>
+  io.to(room(s.code)).emit('segment:unavailable', {
+    sequence: segment.sequence,
+    provider
+  });
+
+const finish = s => {
+  s.generation++;
+  s.recognizer?.stop();
+  s.recognizer = null;
+  s.status = 'ended';
+  emitState(s);
+};
+
+io.on('connection', socket => {
+  socket.on('teacher:create', ({ accessCode } = {}, reply = () => {}) => {
+    if (!validTeacherAccess(accessCode)) {
+      socket.data.teacherAccessFailures =
+        (socket.data.teacherAccessFailures || 0) + 1;
+
+      reply({
+        ok: false,
+        error: 'Teacher access code is invalid.'
+      });
+
+      if (socket.data.teacherAccessFailures >= 5) {
+        setTimeout(() => socket.disconnect(true), 100);
+      }
+      return;
+    }
+
+    socket.data.teacherAccessFailures = 0;
+    store.removeTeacher(socket.id);
+
+    const s = store.create(socket.id);
+    socket.data.role = 'teacher';
+    socket.join(room(s.code));
+
+    reply({
+      ok: true,
+      session: state(s)
+    });
+  });
+
+  socket.on('student:join', ({ code } = {}, reply = () => {}) => {
+    const s = store.get(code);
+
+    if (!s || s.status === 'ended') {
+      return reply({
+        ok: false,
+        error: 'Session not found or has ended.'
+      });
+    }
+
+    s.students.add(socket.id);
+    socket.data.role = 'student';
+    socket.data.sessionCode = s.code;
+    socket.join(room(s.code));
+
+    emitState(s);
+
+    reply({
+      ok: true,
+      session: state(s)
+    });
+  });
+
+  socket.on('lecture:start', ({ code }, reply = () => {}) => {
+    const s = store.get(code);
+
+    if (!s || s.teacherId !== socket.id) {
+      return reply({
+        ok: false,
+        error: 'Invalid teacher session.'
+      });
+    }
+
+    try {
+      s.recognizer?.stop();
+      s.recognizer = recognizer(s, socket);
+      s.status = 'live';
+      emitState(s);
+      reply({ ok: true });
+    } catch (e) {
+      reply({ ok: false, error: e.message });
+    }
+  });
+
+  socket.on('dev:test-translation', async (
+    { code } = {},
+    reply = () => {}
+  ) => {
+    const remote = socket.handshake.address;
+
+    if (![
+      '127.0.0.1',
+      '::1',
+      '::ffff:127.0.0.1'
+    ].includes(remote)) {
+      return reply({
+        ok: false,
+        error: 'Local testing only.'
+      });
+    }
+
+    const s = store.get(code);
+
+    if (
+      !s ||
+      s.teacherId !== socket.id ||
+      !['ready', 'live'].includes(s.status)
+    ) {
+      return reply({
+        ok: false,
+        error: 'Invalid or inactive teacher session.'
+      });
+    }
+
+    if (s.recognizer) {
+      return reply({
+        ok: false,
+        error: 'Stop microphone lecture before testing.'
+      });
+    }
+
+    s.status = 'live';
+    emitState(s);
+    reply({ ok: true });
+
+    await processPhrase(s, {
+      text: 'Good morning, class. Today we are learning how alcohol affects the brain and body.',
+      source: 'development-test',
+      audioAt: Date.now(),
+      transcribedAt: Date.now(),
+      stability: 1
+    });
+  });
+
+  socket.on('audio:chunk', ({ code, audio, capturedAt }) => {
+    const s = store.get(code);
+
+    if (s?.teacherId === socket.id && s.status === 'live') {
+      s.lastAudioAt = Number(capturedAt) || Date.now();
+      s.phraseAudioAt ??= s.lastAudioAt;
+      s.recognizer?.write(Buffer.from(audio));
+    }
+  });
+
+  socket.on('lecture:pause', ({ code }) => {
+    const s = store.get(code);
+
+    if (s?.teacherId === socket.id) {
+      s.generation++;
+      s.recognizer?.stop();
+      s.recognizer = null;
+      s.status = 'paused';
+      emitState(s);
+    }
+  });
+
+  socket.on('lecture:resume', ({ code }) => {
+    const s = store.get(code);
+
+    if (s?.teacherId === socket.id) {
+      s.recognizer = recognizer(s, socket);
+      s.status = 'live';
+      emitState(s);
+    }
+  });
+
+  socket.on('lecture:end', ({ code }) => {
+    const s = store.get(code);
+
+    if (s?.teacherId === socket.id) {
+      finish(s);
+    }
+  });
+
+  socket.on('audio:playback', ({
+    code,
+    segmentId,
+    event,
+    at,
+    queue,
+    provider
+  }) => {
+    const s = store.get(code);
+    const seg = s?.segments.find(x => x.id === segmentId);
+
+    if (!seg) return;
+
+    const playbackAt = Number(at);
+
+    console.info('[audio-queue]', JSON.stringify({
+      code,
+      segmentId,
+      sequence: seg.sequence,
+      provider: provider === 'browser' ? 'browser' : 'google',
+      event,
+      speechToAudioStartMs:
+        event === 'started' ? playbackAt - seg.audioAt : undefined,
+      translationToAudioStartMs:
+        event === 'started' ? playbackAt - seg.translatedAt : undefined,
+      queue
+    }));
+  });
+
+  socket.on('disconnect', () => {
+    const s = store.sessions.get(socket.data.sessionCode);
+
+    if (s) {
+      s.students.delete(socket.id);
+      emitState(s);
+    }
+
+    for (const x of store.sessions.values()) {
+      if (x.teacherId === socket.id) {
+        finish(x);
+      }
+    }
+  });
+});
+
+function recognizer(s, socket) {
+  s.phraseSegmenter = new PhraseSegmenter();
+  s.phraseAudioAt = null;
+
+  return google.createRecognition(
+    r => handleRecognition(s, r),
+    e => {
+      console.error('[speech]', e);
+      socket.emit(
+        'lecture:error',
+        'Speech recognition stopped. Check Google Cloud setup.'
+      );
+    }
+  );
+}
+
+function handleRecognition(s, result) {
+  io.to(room(s.code)).emit('transcript:interim', {
+    text: result.text,
+    isFinal: result.isFinal
+  });
+
+  if (s.status !== 'live') return;
+
+  for (const phrase of s.phraseSegmenter.push(result)) {
+    const audioAt =
+      s.phraseAudioAt ||
+      s.lastAudioAt ||
+      result.transcribedAt;
+
+    s.phraseAudioAt = s.lastAudioAt;
+
+    processPhrase(s, {
+      ...result,
+      text: phrase.text,
+      source: phrase.source,
+      audioAt
+    });
+  }
+}
+
+async function processPhrase(s, result) {
+  const generation = s.generation;
+
+  const segment = {
+    id: crypto.randomUUID(),
+    sequence: s.nextSequence++,
+    english: result.text,
+    source: result.source,
+    spanish: '',
+    audioAt: result.audioAt,
+    transcribedAt: result.transcribedAt,
+    translationRequestedAt: Date.now()
+  };
+
+  s.segments.push(segment);
+
+  if (s.segments.length > 200) {
+    s.segments.shift();
+  }
+
+  console.info('[segmentation]', JSON.stringify({
+    code: s.code,
+    sequence: segment.sequence,
+    source: segment.source,
+    words: segment.english.split(/\s+/).length,
+    stability: result.stability
+  }));
+
+  try {
+    segment.spanish = await google.translate(result.text, 'es');
+    segment.translatedAt = Date.now();
+
+    if (s.status !== 'live' || s.generation !== generation) {
+      cancelSegment(s, segment, 'both');
+      return;
+    }
+
+    segment.sentAt = Date.now();
+
+    io.to(room(s.code)).emit(
+      'segment:translated',
+      publicSegment(segment)
+    );
+
+    segment.ttsRequestedAt = Date.now();
+    segment.audioBase64 =
+      await google.synthesizeSpanish(segment.spanish);
+    segment.ttsReturnedAt = Date.now();
+
+    if (s.status !== 'live' || s.generation !== generation) {
+      cancelSegment(s, segment, 'google');
+      return;
+    }
+
+    segment.sentAt = Date.now();
+
+    io.to(room(s.code)).emit('segment:ready', segment);
+
+    console.info('[latency]', JSON.stringify({
+      code: s.code,
+      segmentId: segment.id,
+      sequence: segment.sequence,
+      source: segment.source,
+      audioToTranscriptMs:
+        segment.transcribedAt - segment.audioAt,
+      translationMs:
+        segment.translatedAt - segment.translationRequestedAt,
+      ttsMs:
+        segment.ttsReturnedAt - segment.ttsRequestedAt,
+      serverToAudioReadyMs:
+        segment.sentAt - segment.audioAt
+    }));
+  } catch (e) {
+    console.error('[voice-pipeline]', e);
+
+    cancelSegment(
+      s,
+      segment,
+      segment.spanish ? 'google' : 'both'
+    );
+
+    io.to(room(s.code)).emit(
+      'lecture:error',
+      'Voice translation failed. Check Google Cloud setup.'
+    );
+  }
+}
+
+setInterval(() => store.sweep(), 60_000).unref();
+
+let shuttingDown = false;
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+
+  shuttingDown = true;
+  console.info(`[shutdown] ${signal}`);
+
+  for (const session of store.sessions.values()) {
+    finish(session);
+  }
+
+  io.close(() =>
+    httpServer.close(() => process.exit(0))
+  );
+
+  setTimeout(() => process.exit(1), 25_000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+httpServer.listen(port, '0.0.0.0', () => {
+  console.log(
+    `LectureBridge server listening on 0.0.0.0:${port}`
+  );
+});
