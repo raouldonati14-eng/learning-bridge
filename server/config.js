@@ -6,7 +6,12 @@ export function socketCorsOptions(env=process.env){
   return env.NODE_ENV==='production'?{origin:false}:{origin:true,credentials:false};
 }
 export function isAllowedSocketOrigin(request,env=process.env){
-  const origin=request.headers?.origin;if(env.NODE_ENV!=='production')return true;if(!origin)return false;
+   const origin = request.headers?.origin;
+  if (env.NODE_ENV !== 'production') return true;
+  if (!origin) {
+    const site = String(request.headers?.['sec-fetch-site'] || '').toLowerCase();
+    return site === 'same-origin';
+  }
   if(env.CLIENT_ORIGIN)return env.CLIENT_ORIGIN.split(',').map(x=>x.trim()).filter(Boolean).includes(origin);
   try{const originUrl=new URL(origin),forwardedHost=String(request.headers['x-forwarded-host']||request.headers.host||'').split(',')[0].trim();return originUrl.protocol==='https:'&&originUrl.host===forwardedHost;}catch{return false;}
 }
